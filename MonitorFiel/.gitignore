@@ -1,0 +1,7 @@
+
+# Environment Variables
+.env
+
+# Build results
+[Bb]in/
+[Oo]bj/
