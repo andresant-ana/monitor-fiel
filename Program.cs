@@ -19,47 +19,37 @@ namespace MonitorFiel
     class Program
     {
         private static string MATCH_URL;
-        private static string CATEGORIA_URL;
         private static string TELEGRAM_BOT_TOKEN;
         private static string TELEGRAM_CHAT_ID;
+        
+        // Arquivo local pra salvar os cookies e não precisar logar toda vez
         private static string COOKIE_FILE = "session_cookies.json";
 
         static async Task Main(string[] args)
         {
+            // Carrega as variáveis de ambiente do arquivo .env
             Env.Load();
 
+            // Atribui os valores das variáveis de ambiente
             MATCH_URL = Environment.GetEnvironmentVariable("MATCH_URL");
             TELEGRAM_BOT_TOKEN = Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN");
             TELEGRAM_CHAT_ID = Environment.GetEnvironmentVariable("TELEGRAM_CHAT_ID");
 
+            // Validação simples pra garantir que o .env tá certo
             if (string.IsNullOrEmpty(MATCH_URL) || string.IsNullOrEmpty(TELEGRAM_BOT_TOKEN) || string.IsNullOrEmpty(TELEGRAM_CHAT_ID))
             {
                 Console.WriteLine("ERRO CRÍTICO: Variáveis de ambiente não encontradas. Verifique o arquivo .env.");
                 return;
             }
 
-            // Deriva a URL de categoria a partir da URL de setores
-            // Ex: .../corinthians-x-palmeiras-br26/setores/ -> .../corinthians-x-palmeiras-br26/categoria/
-            CATEGORIA_URL = MATCH_URL.Replace("/setores/", "/categoria/");
-            if (CATEGORIA_URL == MATCH_URL)
-            {
-                // Fallback: se MATCH_URL já não tem /setores/, tenta construir
-                CATEGORIA_URL = MATCH_URL.TrimEnd('/');
-                // Remove último segmento e substitui por /categoria/
-                int lastSlash = CATEGORIA_URL.LastIndexOf('/');
-                if (lastSlash > 0)
-                    CATEGORIA_URL = CATEGORIA_URL.Substring(0, lastSlash) + "/categoria/";
-            }
-
-            Console.WriteLine($"Iniciando Monitor Fiel Torcedor (Versão V23)...");
-            Console.WriteLine($"URL Setores  : {MATCH_URL}");
-            Console.WriteLine($"URL Categoria: {CATEGORIA_URL}");
+            Console.WriteLine("Iniciando Monitor Fiel Torcedor (Versão V22)...");
 
             var options = new ChromeOptions();
             options.AddArgument("--start-maximized");
 
             using (IWebDriver driver = new ChromeDriver(options))
             {
+                // Tenta reaproveitar a sessão anterior
                 bool loggedIn = LoginRoutine(driver);
 
                 if (!loggedIn)
@@ -68,98 +58,63 @@ namespace MonitorFiel
                     return;
                 }
 
-                // Após login, já navega para a página de categoria pra confirmar que tá tudo ok
-                Console.WriteLine("Navegando para a página de categoria do jogo...");
-                driver.Navigate().GoToUrl(CATEGORIA_URL);
-                Thread.Sleep(4000);
-                Console.WriteLine($"Sessão ativa. URL atual: {driver.Url}");
-                Console.WriteLine("Iniciando monitoramento. Pressione Ctrl+C para encerrar.");
-
                 var botClient = new TelegramBotClient(TELEGRAM_BOT_TOKEN);
 
+                Console.WriteLine($"Iniciando monitoramento para: {MATCH_URL}");
+                Console.WriteLine("Pressione Ctrl+C para encerrar.");
+
+                // Loop infinito de monitoramento
                 while (true)
                 {
                     try
                     {
-                        // PASSO 1: Vai para a página de categoria
-                        driver.Navigate().GoToUrl(CATEGORIA_URL);
+                        driver.Navigate().GoToUrl(MATCH_URL);
+                        
                         Thread.Sleep(5000);
 
-                        // Checa se sessão expirou
+                        // Se cair a sessão, refaço o login automático
                         if (driver.Url.Contains("login") || driver.Url.Contains("auth"))
                         {
-                            Console.WriteLine("Sessão expirada. Refazendo login...");
+                            Console.WriteLine("Sessão expirada durante o monitoramento. Refazendo login...");
                             LoginRoutine(driver);
                             continue;
                         }
 
-                        // PASSO 2: Verifica se algum card tem o botão COMPRAR (saiu do estado Esgotado)
-                        bool temIngressoDisponivel = CheckIfAnyTicketAvailable(driver);
+                        bool norteDisponivel = CheckSectorAvailability(driver, "norte");
+                        bool sulDisponivel = CheckSectorAvailability(driver, "sul");
 
-                        if (!temIngressoDisponivel)
+                        if (norteDisponivel || sulDisponivel)
                         {
-                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Esgotado na página de categoria. Aguardando...");
+                            string msg = $"🚨 ALERTA FIEL! Ingressos Encontrados!\n";
+                            if (norteDisponivel) msg += "✅ SETOR NORTE DISPONÍVEL\n";
+                            if (sulDisponivel) msg += "✅ SETOR SUL DISPONÍVEL\n";
+                            msg += $"\nCorra: {MATCH_URL}";
+                            
+                            Console.WriteLine("INGRESSO ENCONTRADO! Enviando Telegram...");
+                            
+                            await botClient.SendMessage(
+                                chatId: TELEGRAM_CHAT_ID, 
+                                text: msg
+                            );
+                            
+                            Console.Beep(1000, 2000);
                         }
                         else
                         {
-                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Algum ingresso disponível na categoria! Verificando setor Norte...");
-
-                            // PASSO 3: Navega para a tela do estádio (setores)
-                            driver.Navigate().GoToUrl(MATCH_URL);
-                            Thread.Sleep(5000);
-
-                            // Checa se caiu em redirect ou login
-                            if (driver.Url.Contains("login") || driver.Url.Contains("auth"))
-                            {
-                                Console.WriteLine("Redirecionado para login ao acessar setores. Refazendo login...");
-                                LoginRoutine(driver);
-                                continue;
-                            }
-
-                            // Se redirecionou de volta pra categoria, significa que não abriu ainda pra este plano
-                            if (driver.Url.Contains("/categoria/"))
-                            {
-                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Redirecionado para categoria. Setores ainda não disponíveis para este plano.");
-                            }
-                            else
-                            {
-                                // PASSO 4: Checa o setor Norte no mapa do estádio
-                                bool norteDisponivel = CheckSectorAvailability(driver, "norte");
-                                bool sulDisponivel = CheckSectorAvailability(driver, "sul");
-
-                                if (norteDisponivel || sulDisponivel)
-                                {
-                                    string msg = $"🚨 ALERTA FIEL! Ingressos Encontrados!\n";
-                                    if (norteDisponivel) msg += "✅ SETOR NORTE DISPONÍVEL\n";
-                                    if (sulDisponivel) msg += "✅ SETOR SUL DISPONÍVEL\n";
-                                    msg += $"\nCorra: {MATCH_URL}";
-
-                                    Console.WriteLine("🚨 INGRESSO ENCONTRADO! Enviando Telegram...");
-
-                                    await botClient.SendMessage(
-                                        chatId: TELEGRAM_CHAT_ID,
-                                        text: msg
-                                    );
-
-                                    Console.Beep(1000, 2000);
-                                }
-                                else
-                                {
-                                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Na tela de setores: Norte={norteDisponivel} | Sul={sulDisponivel}");
-                                }
-                            }
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Nada ainda. Norte: {(norteDisponivel ? "ON" : "OFF")} | Sul: {(sulDisponivel ? "ON" : "OFF")}");
                         }
 
                         // Delay aleatório pra evitar bloqueio do WAF
                         Random rnd = new Random();
-                        int waitTime = rnd.Next(45000, 90001);
-                        Console.WriteLine($"Aguardando {waitTime / 1000}s até próxima verificação...");
+                        int waitTime = rnd.Next(60000, 120001);
+                        Console.WriteLine($"Aguardando {waitTime / 1000} segundos...");
                         Thread.Sleep(waitTime);
+
                     }
                     catch (Exception ex)
                     {
                         Console.WriteLine($"Erro no loop: {ex.Message}");
-                        Thread.Sleep(10000);
+                        Thread.Sleep(10000); 
                     }
                 }
             }
@@ -172,32 +127,27 @@ namespace MonitorFiel
                 Console.WriteLine("Carregando sessão salva...");
                 try
                 {
-                    driver.Navigate().GoToUrl("https://www.fieltorcedor.com.br");
-                    Thread.Sleep(2000);
+                    driver.Navigate().GoToUrl("https://www.fieltorcedor.com.br"); 
                     var cookies = JsonConvert.DeserializeObject<List<CookieData>>(File.ReadAllText(COOKIE_FILE));
                     foreach (var cookieData in cookies)
                     {
                         if (cookieData.Expiry.HasValue && cookieData.Expiry < DateTime.Now) continue;
-
+                        
                         driver.Manage().Cookies.AddCookie(new Cookie(
-                            cookieData.Name,
-                            cookieData.Value,
-                            cookieData.Domain,
-                            cookieData.Path,
+                            cookieData.Name, 
+                            cookieData.Value, 
+                            cookieData.Domain, 
+                            cookieData.Path, 
                             cookieData.Expiry));
                     }
-
-                    driver.Navigate().GoToUrl(CATEGORIA_URL);
-                    Thread.Sleep(4000);
+                    
+                    driver.Navigate().GoToUrl(MATCH_URL);
+                    Thread.Sleep(3000);
 
                     if (!driver.Url.Contains("login") && !driver.Url.Contains("auth"))
                     {
                         Console.WriteLine("Sessão restaurada com sucesso.");
                         return true;
-                    }
-                    else
-                    {
-                        Console.WriteLine("Cookies expirados ou inválidos. Precisa fazer login manual.");
                     }
                 }
                 catch (Exception ex)
@@ -208,17 +158,17 @@ namespace MonitorFiel
 
             Console.WriteLine("--- ATENÇÃO NECESSÁRIA ---");
             Console.WriteLine("1. Faça o login manualmente no navegador que abriu.");
-            Console.WriteLine("2. Resolva o Captcha se aparecer.");
-            Console.WriteLine("3. Navegue até a página inicial logada (você verá seu nome no canto).");
+            Console.WriteLine("2. Resolva o Captcha.");
+            Console.WriteLine("3. Navegue até a página inicial logada.");
             Console.WriteLine("4. VOLTE AQUI E APERTE [ENTER].");
-
+            
             driver.Navigate().GoToUrl("https://www.fieltorcedor.com.br/auth/login");
             Console.ReadLine();
 
             Console.WriteLine("Salvando nova sessão...");
             var currentCookies = driver.Manage().Cookies.AllCookies;
             var cookieList = new List<CookieData>();
-            foreach (var c in currentCookies)
+            foreach(var c in currentCookies)
             {
                 cookieList.Add(new CookieData
                 {
@@ -230,46 +180,12 @@ namespace MonitorFiel
                     Secure = c.Secure
                 });
             }
-
+            
             File.WriteAllText(COOKIE_FILE, JsonConvert.SerializeObject(cookieList));
             Console.WriteLine("Sessão salva.");
             return true;
         }
 
-        /// <summary>
-        /// Verifica na página de categoria se algum card tem o botão "COMPRAR"
-        /// (ou seja, não está no estado "Esgotado").
-        /// Estratégia: procura por um link que aponte para /setores/ — isso só existe quando tickets disponíveis.
-        /// Fallback: procura por texto "COMPRAR" que não seja "COMPRE AGORA" do menu.
-        /// </summary>
-        private static bool CheckIfAnyTicketAvailable(IWebDriver driver)
-        {
-            try
-            {
-                // Estratégia 1: link direto para /setores/ — aparece só quando há COMPRAR
-                var setoresLinks = driver.FindElements(By.CssSelector("a[href*='/setores/']"));
-                if (setoresLinks.Count > 0)
-                    return true;
-
-                // Estratégia 2: qualquer elemento com texto "COMPRAR" (a seta dos cards de categoria)
-                // Exclui "COMPRE AGORA" da lista de jogos usando XPath mais específico
-                var comprarTexts = driver.FindElements(
-                    By.XPath("//a[normalize-space(text())='COMPRAR' or normalize-space(.)='COMPRAR →'] | //button[normalize-space(text())='COMPRAR']")
-                );
-                if (comprarTexts.Count > 0)
-                    return true;
-
-                return false;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Na tela de setores, verifica se o setor (por id) NÃO tem a classe "disabled".
-        /// </summary>
         private static bool CheckSectorAvailability(IWebDriver driver, string elementId)
         {
             try
@@ -277,6 +193,8 @@ namespace MonitorFiel
                 var wait = new WebDriverWait(driver, TimeSpan.FromSeconds(5));
                 var element = wait.Until(d => d.FindElement(By.Id(elementId)));
                 string classAttribute = element.GetAttribute("class");
+                
+                // Se não tem a classe 'disabled', tá liberado
                 return !classAttribute.Contains("disabled");
             }
             catch
