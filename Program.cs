@@ -1,7 +1,6 @@
 #nullable disable
 
 using System;
-using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -12,7 +11,6 @@ using OpenQA.Selenium;
 using OpenQA.Selenium.Chrome;
 using OpenQA.Selenium.Support.UI;
 using Telegram.Bot;
-using Telegram.Bot.Types;
 using DotNetEnv;
 
 namespace MonitorFiel
@@ -23,7 +21,40 @@ namespace MonitorFiel
         private static string CATEGORIA_URL;
         private static string TELEGRAM_BOT_TOKEN;
         private static string TELEGRAM_CHAT_ID;
-        private static string COOKIE_FILE = "session_cookies.json";
+        private static readonly string COOKIE_FILE = "session_cookies.json";
+
+        // Intervalos normais de monitoramento. Mantemos jitter para não gerar um padrão fixo.
+        // Não existe intervalo que garanta ausência de bloqueio; por isso há backoff automático
+        // quando a página apresenta sinais típicos de rate limit/bloqueio.
+        private const int CATEGORY_REFRESH_MIN_MS = 8000;
+        private const int CATEGORY_REFRESH_MAX_MS = 12000;
+        private const int SECTOR_REFRESH_MIN_MS = 6000;
+        private const int SECTOR_REFRESH_MAX_MS = 9000;
+        private const int RATE_LIMIT_BACKOFF_MIN_MS = 60000;
+        private const int RATE_LIMIT_BACKOFF_MAX_MS = 120000;
+
+        private const int CATEGORY_CARD_WAIT_MS = 1800;
+        private const int CATEGORY_FALLBACK_REFRESH_MIN_MS = 3000;
+        private const int CATEGORY_FALLBACK_REFRESH_MAX_MS = 4500;
+        private const int PAGE_SETTLE_MS = 1800;
+        private const int RECOVERY_WAIT_MS = 1200;
+        private const int LOCAL_ALARM_SECONDS = 30;
+
+        private static bool scriptFreezeSupported = true;
+        private static int localAlarmRunning = 0;
+
+        private enum MonitorMode
+        {
+            Category,
+            Sectors
+        }
+
+        private enum CategoryState
+        {
+            Unknown,
+            SoldOut,
+            BuyAvailable
+        }
 
         static async Task Main(string[] args)
         {
@@ -33,66 +64,68 @@ namespace MonitorFiel
             TELEGRAM_BOT_TOKEN = Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN");
             TELEGRAM_CHAT_ID = Environment.GetEnvironmentVariable("TELEGRAM_CHAT_ID");
 
-            if (string.IsNullOrEmpty(MATCH_URL) || string.IsNullOrEmpty(TELEGRAM_BOT_TOKEN) || string.IsNullOrEmpty(TELEGRAM_CHAT_ID))
+            if (string.IsNullOrWhiteSpace(MATCH_URL) ||
+                string.IsNullOrWhiteSpace(TELEGRAM_BOT_TOKEN) ||
+                string.IsNullOrWhiteSpace(TELEGRAM_CHAT_ID))
             {
                 Console.WriteLine("ERRO CRÍTICO: Variáveis de ambiente não encontradas. Verifique o arquivo .env.");
                 return;
             }
 
-            // Deriva a URL de categoria a partir da URL de setores
-            // Ex: .../corinthians-x-palmeiras-br26/setores/ -> .../corinthians-x-palmeiras-br26/categoria/
-            CATEGORIA_URL = MATCH_URL.Replace("/setores/", "/categoria/");
-            if (CATEGORIA_URL == MATCH_URL)
-            {
-                // Fallback: se MATCH_URL já não tem /setores/, tenta construir
-                CATEGORIA_URL = MATCH_URL.TrimEnd('/');
-                int lastSlash = CATEGORIA_URL.LastIndexOf('/');
-                if (lastSlash > 0)
-                    CATEGORIA_URL = CATEGORIA_URL.Substring(0, lastSlash) + "/categoria/";
-            }
+            MATCH_URL = EnsureTrailingSlash(MATCH_URL);
+            CATEGORIA_URL = BuildCategoryUrl(MATCH_URL);
 
-            Console.WriteLine("Iniciando Monitor Fiel Torcedor (Versão V24)...");
+            Console.WriteLine("Iniciando Monitor Fiel Torcedor (Versão V26)...");
             Console.WriteLine($"URL Setores  : {MATCH_URL}");
             Console.WriteLine($"URL Categoria: {CATEGORIA_URL}");
+            Console.WriteLine($"Intervalo categoria: {CATEGORY_REFRESH_MIN_MS / 1000}-{CATEGORY_REFRESH_MAX_MS / 1000}s");
+            Console.WriteLine($"Intervalo estádio  : {SECTOR_REFRESH_MIN_MS / 1000}-{SECTOR_REFRESH_MAX_MS / 1000}s");
 
             var options = new ChromeOptions();
             options.AddArgument("--start-maximized");
 
-            // Perfil persistente: salva login, cookies e senhas entre execuções
             string profilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "chrome-profile");
             Directory.CreateDirectory(profilePath);
             options.AddArgument($"--user-data-dir={profilePath}");
 
-            IWebDriver driver = new ChromeDriver(options);
+            var driver = new ChromeDriver(options);
 
-            // Garante que o navegador fecha ao encerrar com Ctrl+C
             Console.CancelKeyPress += (sender, e) =>
             {
                 e.Cancel = true;
                 Console.WriteLine("\nEncerrando... fechando navegador.");
+                try { EnablePageScripts(driver); } catch { }
                 try { driver.Quit(); } catch { }
                 Environment.Exit(0);
             };
 
             try
             {
-                bool loggedIn = LoginRoutine(driver);
-
-                if (!loggedIn)
+                if (!LoginRoutine(driver))
                 {
                     Console.WriteLine("Falha crítica no login. Encerrando.");
-                    driver.Quit();
                     return;
                 }
 
-                Console.WriteLine("Navegando para a página de categoria do jogo...");
-                driver.Navigate().GoToUrl(CATEGORIA_URL);
-                Thread.Sleep(4000);
-                Console.WriteLine($"Sessão ativa. URL atual: {driver.Url}");
-                Console.WriteLine("Iniciando monitoramento. Pressione Ctrl+C para encerrar.");
-
                 var botClient = new TelegramBotClient(TELEGRAM_BOT_TOKEN);
-                bool monitoringSectors = false;
+                MonitorMode mode = MonitorMode.Category;
+                bool previousNorthAvailable = false;
+                bool previousSouthAvailable = false;
+
+                Console.WriteLine("Sessão ativa. Iniciando monitoramento. Pressione Ctrl+C para encerrar.");
+
+                // Se esta mesma sessão já conquistou acesso a /setores/ anteriormente,
+                // o Fiel costuma manter esse acesso mesmo que o card volte a "Esgotado".
+                // Testamos isso uma vez antes de entrar no modo de categoria.
+                if (TryOpenSectors(driver))
+                {
+                    mode = MonitorMode.Sectors;
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ✅ A sessão já possui acesso a /setores/. Entrando direto no estádio.");
+                }
+                else
+                {
+                    EnterPinnedCategory(driver);
+                }
 
                 while (true)
                 {
@@ -100,7 +133,8 @@ namespace MonitorFiel
                     {
                         if (IsAuthPage(driver.Url))
                         {
-                            Console.WriteLine("Sessão expirada. Refazendo login...");
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Sessão expirada. Refazendo login...");
+                            EnablePageScripts(driver);
 
                             if (!LoginRoutine(driver))
                             {
@@ -108,179 +142,272 @@ namespace MonitorFiel
                                 continue;
                             }
 
-                            monitoringSectors = false;
-                            driver.Navigate().GoToUrl(CATEGORIA_URL);
-                            Thread.Sleep(3000);
+                            // Uma sessão nova perde a autorização temporária de /setores/.
+                            mode = MonitorMode.Category;
+                            previousNorthAvailable = false;
+                            previousSouthAvailable = false;
+
+                            if (TryOpenSectors(driver))
+                            {
+                                mode = MonitorMode.Sectors;
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ✅ A nova sessão já conseguiu reabrir /setores/.");
+                            }
+                            else
+                            {
+                                EnterPinnedCategory(driver);
+                            }
+
                             continue;
                         }
 
-                        if (!monitoringSectors)
+                        // Se a aplicação enxergar uma página típica de bloqueio/rate limit, desacelera
+                        // bastante antes de tentar novamente. Isso não tenta contornar o bloqueio;
+                        // apenas reduz a pressão sobre o site.
+                        if (LooksRateLimitedOrBlocked(driver))
                         {
-                            // Durante a fase de categoria, o site pode redirecionar automaticamente
-                            // para /jogos quando os ingressos estão esgotados. Mantemos o navegador
-                            // preso à categoria correta e só abandonamos essa fase quando /setores/ abrir.
-                            if (!EnsureCategoryPage(driver))
+                            int cooldown = Random.Shared.Next(RATE_LIMIT_BACKOFF_MIN_MS, RATE_LIMIT_BACKOFF_MAX_MS + 1);
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ⚠️ Possível rate limit/bloqueio detectado. Pausando {cooldown / 1000}s antes de continuar.");
+                            EnablePageScripts(driver);
+                            Thread.Sleep(cooldown);
+
+                            if (mode == MonitorMode.Category && !IsAuthPage(driver.Url))
+                                EnterPinnedCategory(driver);
+
+                            continue;
+                        }
+
+                        if (mode == MonitorMode.Category)
+                        {
+                            if (!EnsurePinnedCategory(driver))
                             {
-                                Thread.Sleep(1500);
+                                Thread.Sleep(RECOVERY_WAIT_MS);
                                 continue;
                             }
 
-                            bool temIngressoDisponivel = CheckIfAnyTicketAvailable(driver);
+                            CategoryState categoryState = DetectCategoryState(driver);
 
-                            if (!temIngressoDisponivel)
+                            if (categoryState == CategoryState.BuyAvailable)
                             {
-                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Esgotado. Permanecendo na página de categoria.");
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 🚨 Botão COMPRAR encontrado. Tentando abrir /setores/ imediatamente...");
+                                EnablePageScripts(driver);
 
-                                int waitTime = Random.Shared.Next(12000, 18001);
-                                Console.WriteLine($"Aguardando {waitTime / 1000}s antes de atualizar a categoria...");
-                                WaitKeepingCategory(driver, waitTime);
+                                if (TryOpenSectors(driver))
+                                {
+                                    mode = MonitorMode.Sectors;
+                                    previousNorthAvailable = false;
+                                    previousSouthAvailable = false;
+                                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ✅ /setores/ liberado. A partir de agora o monitor fica no estádio até perder a sessão/acesso.");
+                                    continue;
+                                }
 
                                 if (IsAuthPage(driver.Url))
                                     continue;
 
-                                if (IsSectorPage(driver.Url))
-                                {
-                                    monitoringSectors = true;
-                                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Página de setores aberta. Entrando em modo de monitoramento dos setores.");
-                                    continue;
-                                }
-
-                                if (IsCategoryPage(driver.Url))
-                                {
-                                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Atualizando página de categoria...");
-                                    driver.Navigate().Refresh();
-                                    Thread.Sleep(3000);
-                                }
-
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] COMPRAR apareceu, mas /setores/ ainda não abriu. Voltando ao modo categoria.");
+                                EnterPinnedCategory(driver);
                                 continue;
                             }
 
-                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Disponibilidade detectada na categoria! Tentando acessar setores...");
-                            driver.Navigate().GoToUrl(MATCH_URL);
-                            Thread.Sleep(4000);
+                            if (categoryState == CategoryState.SoldOut)
+                            {
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Esgotado. Categoria travada em {CATEGORIA_URL}");
+                            }
+                            else
+                            {
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Estado da categoria ainda não identificado. Mantendo a rota e tentando novamente.");
+                            }
+
+                            int categoryWaitTime = scriptFreezeSupported
+                                ? Random.Shared.Next(CATEGORY_REFRESH_MIN_MS, CATEGORY_REFRESH_MAX_MS + 1)
+                                : Random.Shared.Next(CATEGORY_FALLBACK_REFRESH_MIN_MS, CATEGORY_FALLBACK_REFRESH_MAX_MS + 1);
+
+                            if (scriptFreezeSupported)
+                            {
+                                Console.WriteLine($"Aguardando {categoryWaitTime / 1000.0:F1}s antes de atualizar a categoria...");
+                            }
+                            else
+                            {
+                                Console.WriteLine($"Proteção por CDP indisponível; atualizando em {categoryWaitTime / 1000.0:F1}s para manter a categoria ativa...");
+                            }
+
+                            WaitWhilePinnedToCategory(driver, categoryWaitTime);
 
                             if (IsAuthPage(driver.Url))
-                            {
-                                Console.WriteLine("Redirecionado para login ao acessar setores. Refazendo login...");
                                 continue;
-                            }
-
-                            if (IsSectorPage(driver.Url))
-                            {
-                                monitoringSectors = true;
-                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ✅ Acesso a /setores/ liberado. Permanecendo no mapa de setores.");
-                                continue;
-                            }
-
-                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Setores ainda não acessíveis. URL atual: {driver.Url}");
 
                             if (!IsCategoryPage(driver.Url))
                             {
-                                Console.WriteLine("Voltando para a página de categoria...");
-                                driver.Navigate().GoToUrl(CATEGORIA_URL);
-                                Thread.Sleep(2500);
+                                // Fallback caso o site tenha conseguido sair da categoria.
+                                EnterPinnedCategory(driver);
+                                continue;
                             }
 
+                            RefreshPinnedCategory(driver);
                             continue;
                         }
 
-                        // Uma vez que /setores/ abre, não voltamos deliberadamente para /categoria/.
-                        // O monitor fica no mapa e atualiza a própria página até Norte ou Sul liberar.
+                        // MODO SETORES:
+                        // depois que a sessão obteve /setores/, não consultamos mais o card COMPRAR.
+                        // Mesmo se ele voltar a "Esgotado", continuamos atualizando o estádio.
                         if (!IsSectorPage(driver.Url))
                         {
-                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Saímos da página de setores ({driver.Url}). Voltando ao modo categoria.");
-                            monitoringSectors = false;
+                            if (IsAuthPage(driver.Url))
+                                continue;
 
-                            if (!IsCategoryPage(driver.Url))
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Saímos de /setores/ ({driver.Url}). Tentando reabrir com a mesma sessão...");
+                            EnablePageScripts(driver);
+
+                            if (TryOpenSectors(driver))
                             {
-                                driver.Navigate().GoToUrl(CATEGORIA_URL);
-                                Thread.Sleep(2500);
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] /setores/ reaberto com sucesso.");
                             }
+                            else
+                            {
+                                if (IsAuthPage(driver.Url))
+                                    continue;
 
-                            continue;
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] A sessão perdeu o acesso a /setores/. Voltando a esperar COMPRAR na categoria.");
+                                mode = MonitorMode.Category;
+                                previousNorthAvailable = false;
+                                previousSouthAvailable = false;
+                                EnterPinnedCategory(driver);
+                                continue;
+                            }
                         }
 
-                        bool norteDisponivel = CheckSectorAvailability(driver, "norte");
-                        bool sulDisponivel = CheckSectorAvailability(driver, "sul");
+                        bool northAvailable = CheckSectorAvailability(driver, "norte");
+                        bool southAvailable = CheckSectorAvailability(driver, "sul");
 
-                        if (norteDisponivel || sulDisponivel)
+                        bool northJustOpened = northAvailable && !previousNorthAvailable;
+                        bool southJustOpened = southAvailable && !previousSouthAvailable;
+
+                        if (northJustOpened || southJustOpened)
                         {
-                            string msg = "🚨 ALERTA FIEL! Ingressos Encontrados!\n";
-                            if (norteDisponivel) msg += "✅ SETOR NORTE DISPONÍVEL\n";
-                            if (sulDisponivel) msg += "✅ SETOR SUL DISPONÍVEL\n";
-                            msg += $"\nCorra: {MATCH_URL}";
+                            string message = "🚨 ALERTA FIEL! Ingressos Encontrados!\n";
+                            if (northAvailable) message += "✅ SETOR NORTE DISPONÍVEL\n";
+                            if (southAvailable) message += "✅ SETOR SUL DISPONÍVEL\n";
+                            message += $"\nCorra: {MATCH_URL}";
 
-                            Console.WriteLine("🚨 INGRESSO ENCONTRADO! Enviando Telegram...");
+                            Console.WriteLine("🚨 INGRESSO ENCONTRADO! Disparando alarme local e Telegram...");
 
-                            await botClient.SendMessage(
-                                chatId: TELEGRAM_CHAT_ID,
-                                text: msg
-                            );
+                            // O alarme roda em background para não interromper o monitoramento.
+                            StartLocalAlarm();
 
-                            Console.Beep(1000, 2000);
+                            try
+                            {
+                                await botClient.SendMessage(
+                                    chatId: TELEGRAM_CHAT_ID,
+                                    text: message
+                                );
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"Falha ao enviar alerta no Telegram: {ex.Message}");
+                            }
                         }
                         else
                         {
-                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Setores ainda indisponíveis. Norte={norteDisponivel} | Sul={sulDisponivel}");
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Estádio ativo. Norte={northAvailable} | Sul={southAvailable}");
                         }
 
-                        int sectorWaitTime = Random.Shared.Next(12000, 18001);
-                        Console.WriteLine($"Aguardando {sectorWaitTime / 1000}s antes de atualizar os setores...");
+                        previousNorthAvailable = northAvailable;
+                        previousSouthAvailable = southAvailable;
+
+                        int sectorWaitTime = Random.Shared.Next(SECTOR_REFRESH_MIN_MS, SECTOR_REFRESH_MAX_MS + 1);
+                        Console.WriteLine($"Aguardando {sectorWaitTime / 1000.0:F1}s antes de atualizar o estádio...");
                         Thread.Sleep(sectorWaitTime);
+
+                        if (IsAuthPage(driver.Url))
+                            continue;
 
                         if (IsSectorPage(driver.Url))
                         {
                             driver.Navigate().Refresh();
-                            Thread.Sleep(3000);
+                            Thread.Sleep(PAGE_SETTLE_MS);
                         }
                     }
                     catch (Exception ex)
                     {
                         Console.WriteLine($"Erro no loop: {ex.Message}");
-                        Thread.Sleep(10000);
+                        // Em erro inesperado, desacelera em vez de insistir rapidamente.
+                        Thread.Sleep(15000);
                     }
                 }
             }
             finally
             {
+                try { EnablePageScripts(driver); } catch { }
                 try { driver.Quit(); } catch { }
             }
         }
 
-        private static bool LoginRoutine(IWebDriver driver)
+        private static string EnsureTrailingSlash(string url)
         {
+            return url.EndsWith("/") ? url : url + "/";
+        }
+
+        private static string BuildCategoryUrl(string matchUrl)
+        {
+            if (matchUrl.Contains("/setores/", StringComparison.OrdinalIgnoreCase))
+            {
+                int index = matchUrl.IndexOf("/setores/", StringComparison.OrdinalIgnoreCase);
+                return matchUrl.Substring(0, index) + "/categoria/";
+            }
+
+            string trimmed = matchUrl.TrimEnd('/');
+            int lastSlash = trimmed.LastIndexOf('/');
+
+            if (lastSlash <= 0)
+                throw new InvalidOperationException("MATCH_URL inválida. Informe a URL /setores/ do jogo.");
+
+            return trimmed.Substring(0, lastSlash) + "/categoria/";
+        }
+
+        private static bool LoginRoutine(ChromeDriver driver)
+        {
+            EnablePageScripts(driver);
+
             if (File.Exists(COOKIE_FILE))
             {
                 Console.WriteLine("Carregando sessão salva...");
                 try
                 {
                     driver.Navigate().GoToUrl("https://www.fieltorcedor.com.br");
-                    Thread.Sleep(2000);
-                    var cookies = JsonConvert.DeserializeObject<List<CookieData>>(File.ReadAllText(COOKIE_FILE));
+                    Thread.Sleep(1200);
+
+                    var cookies = JsonConvert.DeserializeObject<List<CookieData>>(File.ReadAllText(COOKIE_FILE))
+                                  ?? new List<CookieData>();
+
                     foreach (var cookieData in cookies)
                     {
-                        if (cookieData.Expiry.HasValue && cookieData.Expiry < DateTime.Now) continue;
+                        if (cookieData.Expiry.HasValue && cookieData.Expiry < DateTime.Now)
+                            continue;
 
-                        driver.Manage().Cookies.AddCookie(new Cookie(
-                            cookieData.Name,
-                            cookieData.Value,
-                            cookieData.Domain,
-                            cookieData.Path,
-                            cookieData.Expiry));
+                        try
+                        {
+                            driver.Manage().Cookies.AddCookie(new Cookie(
+                                cookieData.Name,
+                                cookieData.Value,
+                                cookieData.Domain,
+                                cookieData.Path,
+                                cookieData.Expiry));
+                        }
+                        catch
+                        {
+                            // Um cookie isolado inválido não deve impedir a restauração dos demais.
+                        }
                     }
 
                     driver.Navigate().GoToUrl(CATEGORIA_URL);
-                    Thread.Sleep(4000);
+                    Thread.Sleep(1200);
 
                     if (!IsAuthPage(driver.Url))
                     {
                         Console.WriteLine("Sessão restaurada com sucesso.");
                         return true;
                     }
-                    else
-                    {
-                        Console.WriteLine("Cookies expirados ou inválidos. Precisa fazer login manual.");
-                    }
+
+                    Console.WriteLine("Cookies expirados ou inválidos. Precisa fazer login manual.");
                 }
                 catch (Exception ex)
                 {
@@ -291,18 +418,31 @@ namespace MonitorFiel
             Console.WriteLine("--- ATENÇÃO NECESSÁRIA ---");
             Console.WriteLine("1. Faça o login manualmente no navegador que abriu.");
             Console.WriteLine("2. Resolva o Captcha se aparecer.");
-            Console.WriteLine("3. Navegue até a página inicial logada (você verá seu nome no canto).");
+            Console.WriteLine("3. Aguarde estar realmente logado.");
             Console.WriteLine("4. VOLTE AQUI E APERTE [ENTER].");
 
             driver.Navigate().GoToUrl("https://www.fieltorcedor.com.br/auth/login");
             Console.ReadLine();
 
-            Console.WriteLine("Salvando nova sessão...");
-            var currentCookies = driver.Manage().Cookies.AllCookies;
-            var cookieList = new List<CookieData>();
-            foreach (var c in currentCookies)
+            // Valida o login antes de aceitar a sessão.
+            driver.Navigate().GoToUrl(CATEGORIA_URL);
+            Thread.Sleep(1200);
+
+            if (IsAuthPage(driver.Url))
             {
-                cookieList.Add(new CookieData
+                Console.WriteLine("O login ainda não foi concluído. Tente novamente.");
+                return false;
+            }
+
+            SaveSessionCookies(driver);
+            Console.WriteLine("Sessão salva.");
+            return true;
+        }
+
+        private static void SaveSessionCookies(IWebDriver driver)
+        {
+            var cookieList = driver.Manage().Cookies.AllCookies
+                .Select(c => new CookieData
                 {
                     Name = c.Name,
                     Value = c.Value,
@@ -310,61 +450,133 @@ namespace MonitorFiel
                     Path = c.Path,
                     Expiry = c.Expiry,
                     Secure = c.Secure
-                });
-            }
+                })
+                .ToList();
 
             File.WriteAllText(COOKIE_FILE, JsonConvert.SerializeObject(cookieList));
-            Console.WriteLine("Sessão salva.");
-            return true;
         }
 
         /// <summary>
-        /// Garante que o navegador permaneça na categoria do jogo durante a fase
-        /// de espera. Se o site expulsar o usuário para /jogos, volta imediatamente
-        /// para a categoria configurada.
+        /// Tenta acessar /setores/ com a sessão atual. Se a sessão já tiver conquistado
+        /// esse acesso anteriormente, a página abre mesmo que o card tenha voltado a Esgotado.
         /// </summary>
-        private static bool EnsureCategoryPage(IWebDriver driver)
+        private static bool TryOpenSectors(ChromeDriver driver)
         {
             try
             {
-                if (IsAuthPage(driver.Url))
-                    return false;
-
-                if (IsCategoryPage(driver.Url))
-                    return true;
-
-                if (IsSectorPage(driver.Url))
-                    return false;
-
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Redirecionamento detectado para {driver.Url}");
-                Console.WriteLine("Voltando imediatamente para a página de categoria...");
-
-                driver.Navigate().GoToUrl(CATEGORIA_URL);
-                Thread.Sleep(2500);
-
-                return IsCategoryPage(driver.Url);
+                EnablePageScripts(driver);
+                driver.Navigate().GoToUrl(MATCH_URL);
+                Thread.Sleep(PAGE_SETTLE_MS);
+                return IsSectorPage(driver.Url);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Erro ao garantir página de categoria: {ex.Message}");
+                Console.WriteLine($"Erro ao tentar abrir /setores/: {ex.Message}");
                 return false;
             }
         }
 
         /// <summary>
-        /// Aguarda o próximo refresh observando apenas a URL local do navegador.
-        /// Se o site redirecionar a aba para /jogos durante a espera, retorna para
-        /// a categoria imediatamente sem aguardar o restante do intervalo.
+        /// Entra na categoria e desativa a execução de JavaScript da página via CDP.
+        /// O redirecionamento automático para /jogos é client-side; com os scripts
+        /// congelados, a aba permanece na categoria sem precisar fazer refresh agressivo.
         /// </summary>
-        private static void WaitKeepingCategory(IWebDriver driver, int milliseconds)
+        private static bool EnterPinnedCategory(ChromeDriver driver)
+        {
+            try
+            {
+                if (!IsCategoryPage(driver.Url))
+                {
+                    EnablePageScripts(driver);
+                    driver.Navigate().GoToUrl(CATEGORIA_URL);
+                }
+
+                if (IsAuthPage(driver.Url))
+                    return false;
+
+                // GoToUrl/redirect já terminou de montar a página. Congelamos os scripts
+                // imediatamente, antes do timer client-side conseguir mandar a aba para /jogos.
+                FreezePageScripts(driver);
+                WaitForCategoryCard(driver, CATEGORY_CARD_WAIT_MS);
+
+                // Se o redirecionamento venceu a corrida, voltamos com os scripts já congelados.
+                if (!IsCategoryPage(driver.Url) && !IsAuthPage(driver.Url))
+                {
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Redirecionamento interceptado ({driver.Url}). Reabrindo categoria com scripts congelados...");
+                    driver.Navigate().GoToUrl(CATEGORIA_URL);
+                    FreezePageScripts(driver);
+                    WaitForCategoryCard(driver, CATEGORY_CARD_WAIT_MS);
+                }
+
+                return IsCategoryPage(driver.Url);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Erro ao fixar a página de categoria: {ex.Message}");
+                return false;
+            }
+        }
+
+        private static bool EnsurePinnedCategory(ChromeDriver driver)
+        {
+            if (IsAuthPage(driver.Url))
+                return false;
+
+            if (IsCategoryPage(driver.Url))
+            {
+                FreezePageScripts(driver);
+                return true;
+            }
+
+            if (IsSectorPage(driver.Url))
+                return false;
+
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Site saiu da categoria para {driver.Url}. Forçando retorno...");
+
+            // Se o CDP estiver disponível, navegamos de volta com JavaScript congelado.
+            FreezePageScripts(driver);
+            driver.Navigate().GoToUrl(CATEGORIA_URL);
+            WaitForCategoryCard(driver, CATEGORY_CARD_WAIT_MS);
+
+            return IsCategoryPage(driver.Url);
+        }
+
+        private static void RefreshPinnedCategory(ChromeDriver driver)
+        {
+            try
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Atualizando {CATEGORIA_URL}");
+
+                // Permitimos que o carregamento normal da página execute seus scripts e, assim que
+                // o refresh termina, congelamos novamente antes do redirecionamento atrasado para /jogos.
+                EnablePageScripts(driver);
+                driver.Navigate().Refresh();
+                FreezePageScripts(driver);
+                WaitForCategoryCard(driver, CATEGORY_CARD_WAIT_MS);
+
+                if (!IsCategoryPage(driver.Url) && !IsAuthPage(driver.Url))
+                {
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] O site tentou sair da categoria durante o refresh. Forçando retorno...");
+                    driver.Navigate().GoToUrl(CATEGORIA_URL);
+                    FreezePageScripts(driver);
+                    WaitForCategoryCard(driver, CATEGORY_CARD_WAIT_MS);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Erro ao atualizar categoria: {ex.Message}");
+            }
+        }
+
+        private static void WaitWhilePinnedToCategory(ChromeDriver driver, int milliseconds)
         {
             int elapsed = 0;
-            const int interval = 500;
+            const int pollMs = 150;
 
             while (elapsed < milliseconds)
             {
-                Thread.Sleep(interval);
-                elapsed += interval;
+                Thread.Sleep(pollMs);
+                elapsed += pollMs;
 
                 string currentUrl = driver.Url;
 
@@ -373,83 +585,264 @@ namespace MonitorFiel
 
                 if (!IsCategoryPage(currentUrl))
                 {
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Site redirecionou para {currentUrl}");
-                    Console.WriteLine("Reabrindo a categoria imediatamente...");
-
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Redirecionamento para {currentUrl} detectado. Voltando à categoria agora...");
+                    FreezePageScripts(driver);
                     driver.Navigate().GoToUrl(CATEGORIA_URL);
-                    Thread.Sleep(2000);
+                    WaitForCategoryCard(driver, CATEGORY_CARD_WAIT_MS);
+                    FreezePageScripts(driver);
                     return;
                 }
             }
         }
 
+        private static void WaitForCategoryCard(IWebDriver driver, int timeoutMs)
+        {
+            try
+            {
+                var wait = new WebDriverWait(driver, TimeSpan.FromMilliseconds(timeoutMs));
+                wait.Until(d =>
+                {
+                    if (!IsCategoryPage(d.Url))
+                        return true;
+
+                    var cards = d.FindElements(By.CssSelector("#main-content .meuplano-card"));
+                    if (cards.Count > 0)
+                        return true;
+
+                    var mainContents = d.FindElements(By.Id("main-content"));
+                    if (mainContents.Count == 0)
+                        return false;
+
+                    string text = mainContents[0].Text ?? string.Empty;
+                    return text.Contains("Esgotado", StringComparison.OrdinalIgnoreCase) ||
+                           text.Contains("COMPRAR", StringComparison.OrdinalIgnoreCase);
+                });
+            }
+            catch
+            {
+                // A detecção de estado possui fallback por texto/links; timeout aqui não encerra o loop.
+            }
+        }
+
+        private static CategoryState DetectCategoryState(IWebDriver driver)
+        {
+            try
+            {
+                if (!IsCategoryPage(driver.Url))
+                    return CategoryState.Unknown;
+
+                var mainContents = driver.FindElements(By.Id("main-content"));
+                if (mainContents.Count == 0)
+                    return CategoryState.Unknown;
+
+                IWebElement main = mainContents[0];
+                string mainText = main.Text ?? string.Empty;
+
+                // Condição mais forte: existe link visível que leva para /setores/.
+                var sectorLinks = main.FindElements(By.CssSelector("a[href*='/setores/']"));
+                if (sectorLinks.Any(link => IsElementVisible(link)))
+                    return CategoryState.BuyAvailable;
+
+                // O card mostrado pelo site exibe literalmente COMPRAR quando liberado.
+                // A busca fica restrita ao main-content para não confundir com o menu "Comprar ingressos".
+                bool hasBuyText = mainText
+                    .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(line => line.Trim())
+                    .Any(line => line.Equals("COMPRAR", StringComparison.OrdinalIgnoreCase) ||
+                                 line.StartsWith("COMPRAR ", StringComparison.OrdinalIgnoreCase));
+
+                if (hasBuyText)
+                    return CategoryState.BuyAvailable;
+
+                if (mainText.Contains("Esgotado", StringComparison.OrdinalIgnoreCase))
+                    return CategoryState.SoldOut;
+
+                // Fallback para a classe já conhecida no HTML do Fiel.
+                var enabledCards = main.FindElements(By.CssSelector(".meuplano-card.enabled"));
+                if (enabledCards.Count > 0)
+                    return CategoryState.BuyAvailable;
+
+                var disabledCards = main.FindElements(By.CssSelector(".meuplano-card.disabled"));
+                if (disabledCards.Count > 0)
+                    return CategoryState.SoldOut;
+
+                return CategoryState.Unknown;
+            }
+            catch (StaleElementReferenceException)
+            {
+                return CategoryState.Unknown;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Erro ao detectar estado da categoria: {ex.Message}");
+                return CategoryState.Unknown;
+            }
+        }
+
+        private static bool IsElementVisible(IWebElement element)
+        {
+            try
+            {
+                return element.Displayed;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Congela a execução de JavaScript no documento atual. Isso impede o timer
+        /// client-side responsável por mandar a categoria esgotada de volta para /jogos.
+        /// Se o Chrome/CDP não aceitar o comando, o monitor usa refresh rápido como fallback.
+        /// </summary>
+        private static void FreezePageScripts(ChromeDriver driver)
+        {
+            if (!scriptFreezeSupported)
+                return;
+
+            try
+            {
+                driver.ExecuteCdpCommand(
+                    "Emulation.setScriptExecutionDisabled",
+                    new Dictionary<string, object> { ["value"] = true }
+                );
+            }
+            catch (Exception ex)
+            {
+                scriptFreezeSupported = false;
+                Console.WriteLine($"Aviso: não foi possível congelar JavaScript via CDP ({ex.Message}). Usando modo de refresh rápido.");
+            }
+        }
+
+        private static void EnablePageScripts(ChromeDriver driver)
+        {
+            if (!scriptFreezeSupported)
+                return;
+
+            try
+            {
+                driver.ExecuteCdpCommand(
+                    "Emulation.setScriptExecutionDisabled",
+                    new Dictionary<string, object> { ["value"] = false }
+                );
+            }
+            catch (Exception ex)
+            {
+                scriptFreezeSupported = false;
+                Console.WriteLine($"Aviso: não foi possível reativar JavaScript via CDP ({ex.Message}).");
+            }
+        }
+
+        /// <summary>
+        /// Detecta algumas respostas comuns de proteção/rate limit. O objetivo é somente
+        /// desacelerar automaticamente quando o site demonstra que não quer mais tráfego.
+        /// </summary>
+        private static bool LooksRateLimitedOrBlocked(IWebDriver driver)
+        {
+            try
+            {
+                string title = driver.Title ?? string.Empty;
+                string source = driver.PageSource ?? string.Empty;
+                string sample = (title + "\n" + source).ToLowerInvariant();
+
+                string[] markers =
+                {
+                    "too many requests",
+                    "rate limit",
+                    "access denied",
+                    "temporarily blocked",
+                    "request blocked",
+                    "error 429",
+                    "http 429"
+                };
+
+                return markers.Any(sample.Contains);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Dispara um alarme insistente no computador sem bloquear o loop principal.
+        /// O volume final depende do volume do sistema operacional/dispositivo de áudio.
+        /// </summary>
+        private static void StartLocalAlarm()
+        {
+            if (Interlocked.Exchange(ref localAlarmRunning, 1) == 1)
+                return;
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    Console.WriteLine($"🔊 ALARME LOCAL ATIVO por aproximadamente {LOCAL_ALARM_SECONDS}s!");
+                    DateTime until = DateTime.UtcNow.AddSeconds(LOCAL_ALARM_SECONDS);
+
+                    while (DateTime.UtcNow < until)
+                    {
+                        try
+                        {
+                            Console.Beep(2000, 450);
+                            Console.Beep(1200, 450);
+                            Console.Beep(2200, 450);
+                            Console.Beep(1000, 450);
+                        }
+                        catch
+                        {
+                            // Fallback para terminais/sistemas onde Console.Beep não é suportado.
+                            Console.Write('\a');
+                            Thread.Sleep(900);
+                        }
+
+                        Thread.Sleep(120);
+                    }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref localAlarmRunning, 0);
+                }
+            });
+        }
+
         private static bool IsAuthPage(string url)
         {
-            return url.Contains("/login", StringComparison.OrdinalIgnoreCase) ||
-                   url.Contains("/auth", StringComparison.OrdinalIgnoreCase);
+            return !string.IsNullOrEmpty(url) &&
+                   (url.Contains("/login", StringComparison.OrdinalIgnoreCase) ||
+                    url.Contains("/auth", StringComparison.OrdinalIgnoreCase));
         }
 
         private static bool IsCategoryPage(string url)
         {
-            return url.Contains("/categoria/", StringComparison.OrdinalIgnoreCase);
+            return !string.IsNullOrEmpty(url) &&
+                   url.StartsWith(CATEGORIA_URL.TrimEnd('/'), StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool IsSectorPage(string url)
         {
-            return url.Contains("/setores/", StringComparison.OrdinalIgnoreCase);
+            return !string.IsNullOrEmpty(url) &&
+                   url.StartsWith(MATCH_URL.TrimEnd('/'), StringComparison.OrdinalIgnoreCase);
         }
 
-        /// <summary>
-        /// Verifica na página de categoria se existe acesso real aos setores.
-        /// Primeiro procura um link para /setores/ e usa o card enabled como fallback.
-        /// </summary>
-        private static bool CheckIfAnyTicketAvailable(IWebDriver driver)
-        {
-            try
-            {
-                var sectorLinks = driver.FindElements(
-                    By.CssSelector("#main-content a[href*='/setores/']")
-                );
-
-                if (sectorLinks.Count > 0)
-                {
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Link para /setores/ encontrado na página de categoria.");
-                    return true;
-                }
-
-                var enabledCards = driver.FindElements(
-                    By.CssSelector("#main-content .meuplano-card.enabled")
-                );
-
-                if (enabledCards.Count > 0)
-                {
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {enabledCards.Count} card(s) habilitado(s) encontrado(s) na página de categoria.");
-                    return true;
-                }
-
-                return false;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Erro em CheckIfAnyTicketAvailable: {ex.Message}");
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Na tela de setores, verifica se o setor (por id) NÃO tem a classe "disabled".
-        /// </summary>
         private static bool CheckSectorAvailability(IWebDriver driver, string elementId)
         {
             try
             {
-                var wait = new WebDriverWait(driver, TimeSpan.FromSeconds(5));
+                var wait = new WebDriverWait(driver, TimeSpan.FromSeconds(4));
                 var element = wait.Until(d => d.FindElement(By.Id(elementId)));
-                string classAttribute = element.GetAttribute("class");
-                return !classAttribute.Contains("disabled");
+                string classAttribute = element.GetAttribute("class") ?? string.Empty;
+                return !classAttribute.Contains("disabled", StringComparison.OrdinalIgnoreCase);
             }
-            catch
+            catch (WebDriverTimeoutException)
             {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Setor '{elementId}' não encontrado a tempo.");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Erro verificando setor '{elementId}': {ex.Message}");
                 return false;
             }
         }
