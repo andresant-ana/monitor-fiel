@@ -46,13 +46,12 @@ namespace MonitorFiel
             {
                 // Fallback: se MATCH_URL já não tem /setores/, tenta construir
                 CATEGORIA_URL = MATCH_URL.TrimEnd('/');
-                // Remove último segmento e substitui por /categoria/
                 int lastSlash = CATEGORIA_URL.LastIndexOf('/');
                 if (lastSlash > 0)
                     CATEGORIA_URL = CATEGORIA_URL.Substring(0, lastSlash) + "/categoria/";
             }
 
-            Console.WriteLine($"Iniciando Monitor Fiel Torcedor (Versão V23)...");
+            Console.WriteLine("Iniciando Monitor Fiel Torcedor (Versão V24)...");
             Console.WriteLine($"URL Setores  : {MATCH_URL}");
             Console.WriteLine($"URL Categoria: {CATEGORIA_URL}");
 
@@ -93,77 +92,147 @@ namespace MonitorFiel
                 Console.WriteLine("Iniciando monitoramento. Pressione Ctrl+C para encerrar.");
 
                 var botClient = new TelegramBotClient(TELEGRAM_BOT_TOKEN);
+                bool monitoringSectors = false;
 
                 while (true)
                 {
                     try
                     {
-                        driver.Navigate().GoToUrl(CATEGORIA_URL);
-                        Thread.Sleep(5000);
-
-                        if (driver.Url.Contains("login") || driver.Url.Contains("auth"))
+                        if (IsAuthPage(driver.Url))
                         {
                             Console.WriteLine("Sessão expirada. Refazendo login...");
-                            LoginRoutine(driver);
-                            continue;
-                        }
 
-                        bool temIngressoDisponivel = CheckIfAnyTicketAvailable(driver);
-
-                        if (!temIngressoDisponivel)
-                        {
-                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Esgotado na página de categoria. Aguardando...");
-                        }
-                        else
-                        {
-                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Algum ingresso disponível na categoria! Verificando setor Norte...");
-
-                            driver.Navigate().GoToUrl(MATCH_URL);
-                            Thread.Sleep(5000);
-
-                            if (driver.Url.Contains("login") || driver.Url.Contains("auth"))
+                            if (!LoginRoutine(driver))
                             {
-                                Console.WriteLine("Redirecionado para login ao acessar setores. Refazendo login...");
-                                LoginRoutine(driver);
+                                Thread.Sleep(3000);
                                 continue;
                             }
 
-                            if (driver.Url.Contains("/categoria/"))
-                            {
-                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Redirecionado para categoria. Setores ainda não disponíveis para este plano.");
-                            }
-                            else
-                            {
-                                bool norteDisponivel = CheckSectorAvailability(driver, "norte");
-                                bool sulDisponivel = CheckSectorAvailability(driver, "sul");
-
-                                if (norteDisponivel || sulDisponivel)
-                                {
-                                    string msg = $"🚨 ALERTA FIEL! Ingressos Encontrados!\n";
-                                    if (norteDisponivel) msg += "✅ SETOR NORTE DISPONÍVEL\n";
-                                    if (sulDisponivel) msg += "✅ SETOR SUL DISPONÍVEL\n";
-                                    msg += $"\nCorra: {MATCH_URL}";
-
-                                    Console.WriteLine("🚨 INGRESSO ENCONTRADO! Enviando Telegram...");
-
-                                    await botClient.SendMessage(
-                                        chatId: TELEGRAM_CHAT_ID,
-                                        text: msg
-                                    );
-
-                                    Console.Beep(1000, 2000);
-                                }
-                                else
-                                {
-                                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Na tela de setores: Norte={norteDisponivel} | Sul={sulDisponivel}");
-                                }
-                            }
+                            monitoringSectors = false;
+                            driver.Navigate().GoToUrl(CATEGORIA_URL);
+                            Thread.Sleep(3000);
+                            continue;
                         }
 
-                        Random rnd = new Random();
-                        int waitTime = rnd.Next(12000, 18001);
-                        Console.WriteLine($"Aguardando {waitTime / 1000}s até próxima verificação...");
-                        Thread.Sleep(waitTime);
+                        if (!monitoringSectors)
+                        {
+                            // Durante a fase de categoria, o site pode redirecionar automaticamente
+                            // para /jogos quando os ingressos estão esgotados. Mantemos o navegador
+                            // preso à categoria correta e só abandonamos essa fase quando /setores/ abrir.
+                            if (!EnsureCategoryPage(driver))
+                            {
+                                Thread.Sleep(1500);
+                                continue;
+                            }
+
+                            bool temIngressoDisponivel = CheckIfAnyTicketAvailable(driver);
+
+                            if (!temIngressoDisponivel)
+                            {
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Esgotado. Permanecendo na página de categoria.");
+
+                                int waitTime = Random.Shared.Next(12000, 18001);
+                                Console.WriteLine($"Aguardando {waitTime / 1000}s antes de atualizar a categoria...");
+                                WaitKeepingCategory(driver, waitTime);
+
+                                if (IsAuthPage(driver.Url))
+                                    continue;
+
+                                if (IsSectorPage(driver.Url))
+                                {
+                                    monitoringSectors = true;
+                                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Página de setores aberta. Entrando em modo de monitoramento dos setores.");
+                                    continue;
+                                }
+
+                                if (IsCategoryPage(driver.Url))
+                                {
+                                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Atualizando página de categoria...");
+                                    driver.Navigate().Refresh();
+                                    Thread.Sleep(3000);
+                                }
+
+                                continue;
+                            }
+
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Disponibilidade detectada na categoria! Tentando acessar setores...");
+                            driver.Navigate().GoToUrl(MATCH_URL);
+                            Thread.Sleep(4000);
+
+                            if (IsAuthPage(driver.Url))
+                            {
+                                Console.WriteLine("Redirecionado para login ao acessar setores. Refazendo login...");
+                                continue;
+                            }
+
+                            if (IsSectorPage(driver.Url))
+                            {
+                                monitoringSectors = true;
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ✅ Acesso a /setores/ liberado. Permanecendo no mapa de setores.");
+                                continue;
+                            }
+
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Setores ainda não acessíveis. URL atual: {driver.Url}");
+
+                            if (!IsCategoryPage(driver.Url))
+                            {
+                                Console.WriteLine("Voltando para a página de categoria...");
+                                driver.Navigate().GoToUrl(CATEGORIA_URL);
+                                Thread.Sleep(2500);
+                            }
+
+                            continue;
+                        }
+
+                        // Uma vez que /setores/ abre, não voltamos deliberadamente para /categoria/.
+                        // O monitor fica no mapa e atualiza a própria página até Norte ou Sul liberar.
+                        if (!IsSectorPage(driver.Url))
+                        {
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Saímos da página de setores ({driver.Url}). Voltando ao modo categoria.");
+                            monitoringSectors = false;
+
+                            if (!IsCategoryPage(driver.Url))
+                            {
+                                driver.Navigate().GoToUrl(CATEGORIA_URL);
+                                Thread.Sleep(2500);
+                            }
+
+                            continue;
+                        }
+
+                        bool norteDisponivel = CheckSectorAvailability(driver, "norte");
+                        bool sulDisponivel = CheckSectorAvailability(driver, "sul");
+
+                        if (norteDisponivel || sulDisponivel)
+                        {
+                            string msg = "🚨 ALERTA FIEL! Ingressos Encontrados!\n";
+                            if (norteDisponivel) msg += "✅ SETOR NORTE DISPONÍVEL\n";
+                            if (sulDisponivel) msg += "✅ SETOR SUL DISPONÍVEL\n";
+                            msg += $"\nCorra: {MATCH_URL}";
+
+                            Console.WriteLine("🚨 INGRESSO ENCONTRADO! Enviando Telegram...");
+
+                            await botClient.SendMessage(
+                                chatId: TELEGRAM_CHAT_ID,
+                                text: msg
+                            );
+
+                            Console.Beep(1000, 2000);
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Setores ainda indisponíveis. Norte={norteDisponivel} | Sul={sulDisponivel}");
+                        }
+
+                        int sectorWaitTime = Random.Shared.Next(12000, 18001);
+                        Console.WriteLine($"Aguardando {sectorWaitTime / 1000}s antes de atualizar os setores...");
+                        Thread.Sleep(sectorWaitTime);
+
+                        if (IsSectorPage(driver.Url))
+                        {
+                            driver.Navigate().Refresh();
+                            Thread.Sleep(3000);
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -203,7 +272,7 @@ namespace MonitorFiel
                     driver.Navigate().GoToUrl(CATEGORIA_URL);
                     Thread.Sleep(4000);
 
-                    if (!driver.Url.Contains("login") && !driver.Url.Contains("auth"))
+                    if (!IsAuthPage(driver.Url))
                     {
                         Console.WriteLine("Sessão restaurada com sucesso.");
                         return true;
@@ -250,17 +319,104 @@ namespace MonitorFiel
         }
 
         /// <summary>
-        /// Verifica na página de categoria se algum card tem o botão "COMPRAR"
-        /// (ou seja, não está no estado "Esgotado").
-        /// Estratégia: procura por um link que aponte para /setores/ — isso só existe quando tickets disponíveis.
-        /// Fallback: procura por texto "COMPRAR" que não seja "COMPRE AGORA" do menu.
+        /// Garante que o navegador permaneça na categoria do jogo durante a fase
+        /// de espera. Se o site expulsar o usuário para /jogos, volta imediatamente
+        /// para a categoria configurada.
+        /// </summary>
+        private static bool EnsureCategoryPage(IWebDriver driver)
+        {
+            try
+            {
+                if (IsAuthPage(driver.Url))
+                    return false;
+
+                if (IsCategoryPage(driver.Url))
+                    return true;
+
+                if (IsSectorPage(driver.Url))
+                    return false;
+
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Redirecionamento detectado para {driver.Url}");
+                Console.WriteLine("Voltando imediatamente para a página de categoria...");
+
+                driver.Navigate().GoToUrl(CATEGORIA_URL);
+                Thread.Sleep(2500);
+
+                return IsCategoryPage(driver.Url);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Erro ao garantir página de categoria: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Aguarda o próximo refresh observando apenas a URL local do navegador.
+        /// Se o site redirecionar a aba para /jogos durante a espera, retorna para
+        /// a categoria imediatamente sem aguardar o restante do intervalo.
+        /// </summary>
+        private static void WaitKeepingCategory(IWebDriver driver, int milliseconds)
+        {
+            int elapsed = 0;
+            const int interval = 500;
+
+            while (elapsed < milliseconds)
+            {
+                Thread.Sleep(interval);
+                elapsed += interval;
+
+                string currentUrl = driver.Url;
+
+                if (IsAuthPage(currentUrl) || IsSectorPage(currentUrl))
+                    return;
+
+                if (!IsCategoryPage(currentUrl))
+                {
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Site redirecionou para {currentUrl}");
+                    Console.WriteLine("Reabrindo a categoria imediatamente...");
+
+                    driver.Navigate().GoToUrl(CATEGORIA_URL);
+                    Thread.Sleep(2000);
+                    return;
+                }
+            }
+        }
+
+        private static bool IsAuthPage(string url)
+        {
+            return url.Contains("/login", StringComparison.OrdinalIgnoreCase) ||
+                   url.Contains("/auth", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsCategoryPage(string url)
+        {
+            return url.Contains("/categoria/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsSectorPage(string url)
+        {
+            return url.Contains("/setores/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Verifica na página de categoria se existe acesso real aos setores.
+        /// Primeiro procura um link para /setores/ e usa o card enabled como fallback.
         /// </summary>
         private static bool CheckIfAnyTicketAvailable(IWebDriver driver)
         {
             try
             {
-                // O card disponível tem a classe "enabled". O esgotado tem "disabled".
-                // Procura dentro do #main-content para não pegar falsos positivos de outras partes da página.
+                var sectorLinks = driver.FindElements(
+                    By.CssSelector("#main-content a[href*='/setores/']")
+                );
+
+                if (sectorLinks.Count > 0)
+                {
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Link para /setores/ encontrado na página de categoria.");
+                    return true;
+                }
+
                 var enabledCards = driver.FindElements(
                     By.CssSelector("#main-content .meuplano-card.enabled")
                 );
