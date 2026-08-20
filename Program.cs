@@ -23,13 +23,25 @@ namespace MonitorFiel
         private static string TELEGRAM_CHAT_ID;
         private static readonly string COOKIE_FILE = "session_cookies.json";
 
+        // Intervalos normais de monitoramento. Mantemos jitter para não gerar um padrão fixo.
+        // Não existe intervalo que garanta ausência de bloqueio; por isso há backoff automático
+        // quando a página apresenta sinais típicos de rate limit/bloqueio.
+        private const int CATEGORY_REFRESH_MIN_MS = 8000;
+        private const int CATEGORY_REFRESH_MAX_MS = 12000;
+        private const int SECTOR_REFRESH_MIN_MS = 6000;
+        private const int SECTOR_REFRESH_MAX_MS = 9000;
+        private const int RATE_LIMIT_BACKOFF_MIN_MS = 60000;
+        private const int RATE_LIMIT_BACKOFF_MAX_MS = 120000;
+
         private const int CATEGORY_CARD_WAIT_MS = 1800;
-        private const int CATEGORY_FALLBACK_REFRESH_MIN_MS = 1200;
-        private const int CATEGORY_FALLBACK_REFRESH_MAX_MS = 1800;
+        private const int CATEGORY_FALLBACK_REFRESH_MIN_MS = 3000;
+        private const int CATEGORY_FALLBACK_REFRESH_MAX_MS = 4500;
         private const int PAGE_SETTLE_MS = 1800;
         private const int RECOVERY_WAIT_MS = 1200;
+        private const int LOCAL_ALARM_SECONDS = 30;
 
         private static bool scriptFreezeSupported = true;
+        private static int localAlarmRunning = 0;
 
         private enum MonitorMode
         {
@@ -63,9 +75,11 @@ namespace MonitorFiel
             MATCH_URL = EnsureTrailingSlash(MATCH_URL);
             CATEGORIA_URL = BuildCategoryUrl(MATCH_URL);
 
-            Console.WriteLine("Iniciando Monitor Fiel Torcedor (Versão V25)...");
+            Console.WriteLine("Iniciando Monitor Fiel Torcedor (Versão V26)...");
             Console.WriteLine($"URL Setores  : {MATCH_URL}");
             Console.WriteLine($"URL Categoria: {CATEGORIA_URL}");
+            Console.WriteLine($"Intervalo categoria: {CATEGORY_REFRESH_MIN_MS / 1000}-{CATEGORY_REFRESH_MAX_MS / 1000}s");
+            Console.WriteLine($"Intervalo estádio  : {SECTOR_REFRESH_MIN_MS / 1000}-{SECTOR_REFRESH_MAX_MS / 1000}s");
 
             var options = new ChromeOptions();
             options.AddArgument("--start-maximized");
@@ -146,6 +160,22 @@ namespace MonitorFiel
                             continue;
                         }
 
+                        // Se a aplicação enxergar uma página típica de bloqueio/rate limit, desacelera
+                        // bastante antes de tentar novamente. Isso não tenta contornar o bloqueio;
+                        // apenas reduz a pressão sobre o site.
+                        if (LooksRateLimitedOrBlocked(driver))
+                        {
+                            int cooldown = Random.Shared.Next(RATE_LIMIT_BACKOFF_MIN_MS, RATE_LIMIT_BACKOFF_MAX_MS + 1);
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ⚠️ Possível rate limit/bloqueio detectado. Pausando {cooldown / 1000}s antes de continuar.");
+                            EnablePageScripts(driver);
+                            Thread.Sleep(cooldown);
+
+                            if (mode == MonitorMode.Category && !IsAuthPage(driver.Url))
+                                EnterPinnedCategory(driver);
+
+                            continue;
+                        }
+
                         if (mode == MonitorMode.Category)
                         {
                             if (!EnsurePinnedCategory(driver))
@@ -188,16 +218,16 @@ namespace MonitorFiel
                             }
 
                             int categoryWaitTime = scriptFreezeSupported
-                                ? Random.Shared.Next(12000, 18001)
+                                ? Random.Shared.Next(CATEGORY_REFRESH_MIN_MS, CATEGORY_REFRESH_MAX_MS + 1)
                                 : Random.Shared.Next(CATEGORY_FALLBACK_REFRESH_MIN_MS, CATEGORY_FALLBACK_REFRESH_MAX_MS + 1);
 
                             if (scriptFreezeSupported)
                             {
-                                Console.WriteLine($"Aguardando {categoryWaitTime / 1000}s antes de atualizar a categoria...");
+                                Console.WriteLine($"Aguardando {categoryWaitTime / 1000.0:F1}s antes de atualizar a categoria...");
                             }
                             else
                             {
-                                Console.WriteLine($"Proteção por CDP indisponível; atualizando em {categoryWaitTime}ms para vencer o redirecionamento automático...");
+                                Console.WriteLine($"Proteção por CDP indisponível; atualizando em {categoryWaitTime / 1000.0:F1}s para manter a categoria ativa...");
                             }
 
                             WaitWhilePinnedToCategory(driver, categoryWaitTime);
@@ -258,14 +288,22 @@ namespace MonitorFiel
                             if (southAvailable) message += "✅ SETOR SUL DISPONÍVEL\n";
                             message += $"\nCorra: {MATCH_URL}";
 
-                            Console.WriteLine("🚨 INGRESSO ENCONTRADO! Enviando Telegram...");
+                            Console.WriteLine("🚨 INGRESSO ENCONTRADO! Disparando alarme local e Telegram...");
 
-                            await botClient.SendMessage(
-                                chatId: TELEGRAM_CHAT_ID,
-                                text: message
-                            );
+                            // O alarme roda em background para não interromper o monitoramento.
+                            StartLocalAlarm();
 
-                            try { Console.Beep(1000, 2000); } catch { }
+                            try
+                            {
+                                await botClient.SendMessage(
+                                    chatId: TELEGRAM_CHAT_ID,
+                                    text: message
+                                );
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"Falha ao enviar alerta no Telegram: {ex.Message}");
+                            }
                         }
                         else
                         {
@@ -275,8 +313,8 @@ namespace MonitorFiel
                         previousNorthAvailable = northAvailable;
                         previousSouthAvailable = southAvailable;
 
-                        int sectorWaitTime = Random.Shared.Next(12000, 18001);
-                        Console.WriteLine($"Aguardando {sectorWaitTime / 1000}s antes de atualizar o estádio...");
+                        int sectorWaitTime = Random.Shared.Next(SECTOR_REFRESH_MIN_MS, SECTOR_REFRESH_MAX_MS + 1);
+                        Console.WriteLine($"Aguardando {sectorWaitTime / 1000.0:F1}s antes de atualizar o estádio...");
                         Thread.Sleep(sectorWaitTime);
 
                         if (IsAuthPage(driver.Url))
@@ -291,7 +329,8 @@ namespace MonitorFiel
                     catch (Exception ex)
                     {
                         Console.WriteLine($"Erro no loop: {ex.Message}");
-                        Thread.Sleep(5000);
+                        // Em erro inesperado, desacelera em vez de insistir rapidamente.
+                        Thread.Sleep(15000);
                     }
                 }
             }
@@ -693,6 +732,79 @@ namespace MonitorFiel
                 scriptFreezeSupported = false;
                 Console.WriteLine($"Aviso: não foi possível reativar JavaScript via CDP ({ex.Message}).");
             }
+        }
+
+        /// <summary>
+        /// Detecta algumas respostas comuns de proteção/rate limit. O objetivo é somente
+        /// desacelerar automaticamente quando o site demonstra que não quer mais tráfego.
+        /// </summary>
+        private static bool LooksRateLimitedOrBlocked(IWebDriver driver)
+        {
+            try
+            {
+                string title = driver.Title ?? string.Empty;
+                string source = driver.PageSource ?? string.Empty;
+                string sample = (title + "\n" + source).ToLowerInvariant();
+
+                string[] markers =
+                {
+                    "too many requests",
+                    "rate limit",
+                    "access denied",
+                    "temporarily blocked",
+                    "request blocked",
+                    "error 429",
+                    "http 429"
+                };
+
+                return markers.Any(sample.Contains);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Dispara um alarme insistente no computador sem bloquear o loop principal.
+        /// O volume final depende do volume do sistema operacional/dispositivo de áudio.
+        /// </summary>
+        private static void StartLocalAlarm()
+        {
+            if (Interlocked.Exchange(ref localAlarmRunning, 1) == 1)
+                return;
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    Console.WriteLine($"🔊 ALARME LOCAL ATIVO por aproximadamente {LOCAL_ALARM_SECONDS}s!");
+                    DateTime until = DateTime.UtcNow.AddSeconds(LOCAL_ALARM_SECONDS);
+
+                    while (DateTime.UtcNow < until)
+                    {
+                        try
+                        {
+                            Console.Beep(2000, 450);
+                            Console.Beep(1200, 450);
+                            Console.Beep(2200, 450);
+                            Console.Beep(1000, 450);
+                        }
+                        catch
+                        {
+                            // Fallback para terminais/sistemas onde Console.Beep não é suportado.
+                            Console.Write('\a');
+                            Thread.Sleep(900);
+                        }
+
+                        Thread.Sleep(120);
+                    }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref localAlarmRunning, 0);
+                }
+            });
         }
 
         private static bool IsAuthPage(string url)
